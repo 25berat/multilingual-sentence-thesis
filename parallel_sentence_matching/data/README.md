@@ -1,7 +1,7 @@
 # Data
 
 This repository contains only a **small subset of the data** required to run the full pipeline.  
-The complete datasets are **not included due to size constraints** and will be provided separately (link will be added later).
+The complete datasets are **not included due to size constraints** and will be provided separately ([Link](https://syncandshare.lrz.de/getlink/fiQhwKNzpRQctxoNkg1Qn7/data)).
 
 ---
 
@@ -44,6 +44,11 @@ To reconstruct the training data:
   - `code/gettraindata.py`
   - `code/merger.py`
 - These scripts generate the required training files, including the **merged large dataset**
+Due to size constraints, the full raw datasets are not provided via the link above.  
+Instead, only the merged dataset (directly usable for training) is included.  
+
+The raw data can be reconstructed using:
+`code/gettraindata.py`
 
 ---
 
