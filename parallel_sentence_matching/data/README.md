@@ -14,13 +14,22 @@ This is primarily used for the **source language** during experiments.
 ---
 
 ### `shuffled_custom_data/`
-Contains the **shuffled versions of the data**.  
+Contains the **shuffled versions of the data**, which are generated from the raw data using:
+
+- `code/shuffle_custom_data.py`  
+  → Creates shuffled datasets from the unshuffled data
+
 All **training languages** (except the source language) are taken from this folder.
 
 ---
 
 ### `goldpairs/`
 Contains gold standard alignment files for evaluation.  
+These are generated using:
+
+- `code/make_custom_gold_from_perm.py`  
+  → Generates gold alignment pairs based on permutations
+
 Currently includes subfolders for:
 - `deu_Latn`
 - `tur_Latn`
@@ -40,22 +49,7 @@ To reconstruct the training data:
 
 ## Data Selection Logic
 
-The data used in experiments is **automatically selected** based on the language setting in:
+The data used in experiments is **automatically selected** based on the language setting (`deu_Latn` or `tur_Latn`) in:
 
 ```bash
 code/environment_full_xlmr.sh
-
-
----
-
-## Feature Encoding
-
-The linguistic feature tables used for the regression analysis are processed with:
-
-- `encoder.py`
-- `encoder_one_hot.py`
-
-In this setup, the raw feature tables were provided as Excel files (`.xlsx`).  
-The paths to these raw feature tables are currently **hardcoded inside the encoder scripts** and must be changed manually if the files are stored in a different location.
-
-The encoder scripts generate encoded feature tables that can then be used for the later statistical analysis.
