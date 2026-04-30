@@ -1,30 +1,17 @@
-"""
-This script contains an example how to extend an existent sentence embedding model to new languages.
-
-Given a (monolingual) teacher model you would like to extend to new languages, which is specified in the teacher_model_name
-variable. We train a multilingual student model to imitate the teacher model (variable student_model_name)
-on multiple languages.
-
-For training, you need parallel sentence data (machine translation training data). You need tab-separated files (.tsv)
-with the first column a sentence in a language understood by the teacher model, e.g. English,
-and the further columns contain the according translations for languages you want to extend to.
-
-This scripts downloads automatically the parallel sentences corpus. This corpus contains transcripts from
-talks translated to 100+ languages. For other parallel data, see get_parallel_data_[].py scripts
-
-Further information can be found in our paper:
-Making Monolingual Sentence Embeddings Multilingual using Knowledge Distillation
-https://huggingface.co/papers/2004.09813
-"""
-
+import os
+import sys
+import json
 import logging
 import traceback
+import faulthandler
 from datetime import datetime
 
 import numpy as np
-from datasets import DatasetDict, load_dataset
+import torch
+from datasets import DatasetDict, load_dataset, get_dataset_config_names
+from datasets.utils.logging import disable_progress_bar
 
-from sentence_transformers import LoggingHandler, SentenceTransformer
+from sentence_transformers import SentenceTransformer
 from sentence_transformers.evaluation import (
     EmbeddingSimilarityEvaluator,
     MSEEvaluator,
@@ -35,202 +22,546 @@ from sentence_transformers.losses import MSELoss
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import SentenceTransformerTrainingArguments
 
+
+# =========================
+# PATHS / ENV
+# =========================
+BASE_WORKDIR = os.environ.get(
+    "BASE_WORKDIR",
+    "/dss/dssfs05/lwp-dss-0003/pn39je/pn39je-dss-0004/ge65hon2"
+)
+
+RUN_DIR = f"{BASE_WORKDIR}/student_teacher_run_debug"
+HF_CACHE_DIR = os.environ.get("HF_HOME", f"{BASE_WORKDIR}/hf_cache")
+HF_DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", f"{BASE_WORKDIR}/hf_datasets_cache")
+HF_HUB_CACHE = os.environ.get("HF_HUB_CACHE", f"{BASE_WORKDIR}/hf_hub_cache")
+TMP_DIR = os.environ.get("TMPDIR", f"{BASE_WORKDIR}/tmp")
+
+os.makedirs(RUN_DIR, exist_ok=True)
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+os.makedirs(HF_DATASETS_CACHE, exist_ok=True)
+os.makedirs(HF_HUB_CACHE, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["HF_DATASETS_CACHE"] = HF_DATASETS_CACHE
+os.environ["HUGGINGFACE_HUB_CACHE"] = HF_HUB_CACHE
+os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
+os.environ["TRANSFORMERS_CACHE"] = HF_HUB_CACHE
+os.environ["TMPDIR"] = TMP_DIR
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+disable_progress_bar()
+
+RUN_ID = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+RUN_PATH = f"{RUN_DIR}/run_{RUN_ID}"
+os.makedirs(RUN_PATH, exist_ok=True)
+
+
+# =========================
+# FAULTHANDLER
+# =========================
+faulthandler_log_path = f"{RUN_PATH}/faulthandler.log"
+faulthandler_file = open(faulthandler_log_path, "w")
+faulthandler.enable(faulthandler_file)
+
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
-    format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO, handlers=[LoggingHandler()]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(f"{RUN_PATH}/run.log"),
+    ],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
-# The teacher model is monolingual, we use it for English embeddings
+# =========================
+# CONFIG
+# =========================
 teacher_model_name = "LaBSE"
-# The student model is multilingual, we train it such that embeddings of non-English texts mimic the teacher model's English embeddings
 student_model_name = "cis-lmu/glot500-base"
 
-student_max_seq_length = 128  # Student model max. lengths for inputs (number of word pieces)
-train_batch_size = 64  # Batch size for training
-inference_batch_size = 64  # Batch size at inference
-max_sentences_per_language = 500000  # Maximum number of  parallel sentences for training
+student_max_seq_length = 128
+train_batch_size = 16
+inference_batch_size = 64
+max_sentences_per_language = 100_000
+preprocess_batch_size = 2048
 
-num_train_epochs = 1 # Train for x epochs
-num_evaluation_steps = 5000  # Evaluate performance after every xxxx steps
+num_train_epochs = 1
+num_evaluation_steps = 5000
 
+source_languages = ["en"]
+target_languages = [
+    "de", "ar", "bg", "ca", "cs", "da", "el", "es", "et", "fa", "fi", "fr",
+    "fr-ca", "gl", "gu", "he", "hi", "hr", "hu", "hy", "id", "it", "ja", "ka",
+    "ko", "ku", "lt", "lv", "mk", "mn", "mr", "ms", "my", "nb", "nl", "pl",
+    "pt-br", "pt", "ro", "ru", "sk", "sl", "sq", "sr", "sv", "th", "tr", "uk",
+    "ur", "vi", "zh-cn", "zh-tw",
+]
 
-# Define the language codes you would like to extend the model to
-source_languages = set(["en"])  # Our teacher model accepts English (en) sentences
-# We want to extend the model to these new languages. For language codes, see the header of the train file
-target_languages = set(["de", "ar", "bg", "ca", "cs", "da", "el", "es", "et", "fa", "fi", "fr", "fr-ca", "gl", "gu", "he", "hi", "hr", "hu", "hy", "id", "it", "ja", "ka",
-                        "ko", "ku", "lt", "lv", "mk", "mn", "mr", "ms", "my", "nb", "nl", "pl", "pt-br", "pt", "ro", "ru", "sk", "sl", "sq", "sr", "sv", "th", "tr","uk", "ur", "vi", "zh-cn", "zh-tw"])
-
-
-
-output_dir = (
-    "output/make-multilingual-"
-    + "-".join(sorted(list(source_languages)) + sorted(list(target_languages)))
-    + "-"
-    + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-)
-
-# 1a. Here we define our SentenceTransformer teacher model.
-teacher_model = SentenceTransformer(teacher_model_name)
-# If we want, we can limit the maximum sequence length for the model
-# teacher_model.max_seq_length = 128
-logging.info(f"Teacher model: {teacher_model}")
-
-# 1b. Here we define our SentenceTransformer student model. If not already a Sentence Transformer model,
-# it will automatically create one with "mean" pooling.
-student_model = SentenceTransformer(student_model_name)
-# If we want, we can limit the maximum sequence length for the model
-student_model.max_seq_length = student_max_seq_length
-logging.info(f"Student model: {student_model}")
-
-# 2. Load the parallel sentences training dataset: https://huggingface.co/datasets?other=sentence-transformers&sort=trending&search=parallel-sentences
-# NOTE: We can also use multiple datasets if we want
 dataset_to_use = "sentence-transformers/parallel-sentences-talks"
-# dataset_to_use = "sentence-transformers/parallel-sentences-europarl"
-# dataset_to_use = "sentence-transformers/parallel-sentences-global-voices"
-# dataset_to_use = "sentence-transformers/parallel-sentences-muse"
-# dataset_to_use = "sentence-transformers/parallel-sentences-jw300"
-# dataset_to_use = "sentence-transformers/parallel-sentences-news-commentary"
-# dataset_to_use = "sentence-transformers/parallel-sentences-opensubtitles"
-# dataset_to_use = "sentence-transformers/parallel-sentences-tatoeba"
-# dataset_to_use = "sentence-transformers/parallel-sentences-wikimatrix"
-# dataset_to_use = "sentence-transformers/parallel-sentences-wikititles"
+sts_dataset_name = "mteb/sts17-crosslingual-sts"
+
+debug_subsets_env = os.environ.get("DEBUG_SUBSETS", "").strip()
+debug_subsets = set(x.strip() for x in debug_subsets_env.split(",") if x.strip())
+
+force_redownload = os.environ.get("FORCE_REDOWNLOAD", "0") == "1"
+download_mode = "force_redownload" if force_redownload else None
+
+output_dir = f"{RUN_PATH}/model"
+os.makedirs(output_dir, exist_ok=True)
+
+
+# =========================
+# HELPERS
+# =========================
+def json_dump(obj, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def append_jsonl(path, obj):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def log_exception(context, subset=None, stage=None):
+    err = traceback.format_exc()
+    logger.error(context)
+    logger.error(err)
+    append_jsonl(
+        f"{RUN_PATH}/subset_failures.jsonl",
+        {
+            "time": datetime.now().isoformat(),
+            "subset": subset,
+            "stage": stage,
+            "context": context,
+            "traceback": err,
+        },
+    )
+
+
+# =========================
+# RUN METADATA
+# =========================
+run_metadata = {
+    "run_id": RUN_ID,
+    "run_path": RUN_PATH,
+    "base_workdir": BASE_WORKDIR,
+    "dataset_to_use": dataset_to_use,
+    "sts_dataset_name": sts_dataset_name,
+    "teacher_model_name": teacher_model_name,
+    "student_model_name": student_model_name,
+    "student_max_seq_length": student_max_seq_length,
+    "train_batch_size": train_batch_size,
+    "inference_batch_size": inference_batch_size,
+    "preprocess_batch_size": preprocess_batch_size,
+    "max_sentences_per_language": max_sentences_per_language,
+    "num_train_epochs": num_train_epochs,
+    "num_evaluation_steps": num_evaluation_steps,
+    "source_languages": source_languages,
+    "target_languages": target_languages,
+    "debug_subsets": sorted(debug_subsets),
+    "force_redownload": force_redownload,
+    "env": {
+        "HF_HOME": os.environ.get("HF_HOME"),
+        "HF_DATASETS_CACHE": os.environ.get("HF_DATASETS_CACHE"),
+        "HUGGINGFACE_HUB_CACHE": os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        "HF_HUB_CACHE": os.environ.get("HF_HUB_CACHE"),
+        "TRANSFORMERS_CACHE": os.environ.get("TRANSFORMERS_CACHE"),
+        "TMPDIR": os.environ.get("TMPDIR"),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "HF_HUB_DISABLE_PROGRESS_BARS": os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS"),
+    },
+}
+json_dump(run_metadata, f"{RUN_PATH}/run_metadata.json")
+
+
+# =========================
+# DEVICE INFO
+# =========================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+if torch.cuda.is_available():
+    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+
+logger.info(f"BASE_WORKDIR={BASE_WORKDIR}")
+logger.info(f"HF_HOME={os.environ['HF_HOME']}")
+logger.info(f"HF_DATASETS_CACHE={os.environ['HF_DATASETS_CACHE']}")
+logger.info(f"HUGGINGFACE_HUB_CACHE={os.environ['HUGGINGFACE_HUB_CACHE']}")
+logger.info(f"HF_HUB_CACHE={os.environ['HF_HUB_CACHE']}")
+logger.info(f"TMPDIR={os.environ['TMPDIR']}")
+logger.info(f"RUN_PATH={RUN_PATH}")
+logger.info(f"DEBUG_SUBSETS={sorted(debug_subsets) if debug_subsets else 'ALL'}")
+logger.info(f"FORCE_REDOWNLOAD={force_redownload}")
+
+
+# =========================
+# VALID CONFIGS CHECK
+# =========================
+logger.info(f"Fetching dataset configs for {dataset_to_use}")
+valid_configs = set(get_dataset_config_names(dataset_to_use))
+logger.info(f"Found {len(valid_configs)} valid subsets")
+
+json_dump(sorted(valid_configs), f"{RUN_PATH}/valid_configs.json")
+
+
+# =========================
+# LOAD MODELS
+# =========================
+logger.info("Loading teacher model...")
+teacher_model = SentenceTransformer(teacher_model_name, device=device)
+logger.info(f"Teacher model loaded: {teacher_model_name}")
+
+logger.info("Loading student model...")
+student_model = SentenceTransformer(student_model_name, device=device)
+student_model.max_seq_length = student_max_seq_length
+logger.info(f"Student model loaded: {student_model_name}")
+logger.info(f"Student max_seq_length set to {student_model.max_seq_length}")
+
+
+# =========================
+# LOAD DATASETS
+# =========================
 train_dataset_dict = DatasetDict()
 eval_dataset_dict = DatasetDict()
+
+dataset_summary = {
+    "loaded_train_subsets": [],
+    "loaded_eval_subsets": [],
+    "skipped_not_in_configs": [],
+    "failed_train": [],
+    "failed_dev": [],
+    "failed_preprocess_train": [],
+    "failed_preprocess_eval": [],
+    "sts_loaded": [],
+    "sts_missing": [],
+}
+
 for source_lang in source_languages:
     for target_lang in target_languages:
         subset = f"{source_lang}-{target_lang}"
-        try:
-            train_dataset = load_dataset(dataset_to_use, subset, split="train")
-            if len(train_dataset) > max_sentences_per_language:
-                train_dataset = train_dataset.select(range(max_sentences_per_language))
-        except Exception as exc:
-            logging.error(f"Could not load dataset {dataset_to_use}/{source_lang}-{target_lang}: {exc}")
+
+        if debug_subsets and subset not in debug_subsets:
+            logger.info(f"Skipping {subset} because DEBUG_SUBSETS is active")
+            continue
+
+        logger.info("=" * 80)
+        logger.info(f"Checking subset: {subset}")
+
+        if subset not in valid_configs:
+            logger.warning(f"Skipping {subset} (not in dataset configs)")
+            dataset_summary["skipped_not_in_configs"].append(subset)
             continue
 
         try:
-            eval_dataset = load_dataset(dataset_to_use, subset, split="dev")
+            logger.info(f"Loading TRAIN for {subset}")
+            train_dataset = load_dataset(
+                dataset_to_use,
+                subset,
+                split="train",
+                download_mode=download_mode,
+            )
+            logger.info(f"TRAIN loaded for {subset}: {len(train_dataset)} rows")
+
+            if len(train_dataset) > max_sentences_per_language:
+                logger.info(
+                    f"Reducing train dataset for {subset} from {len(train_dataset)} "
+                    f"to {max_sentences_per_language}"
+                )
+                train_dataset = train_dataset.select(range(max_sentences_per_language))
+        except Exception:
+            log_exception(f"FAILED TRAIN for {subset}", subset=subset, stage="train")
+            dataset_summary["failed_train"].append(subset)
+            continue
+
+        try:
+            logger.info(f"Loading DEV for {subset}")
+            eval_dataset = load_dataset(
+                dataset_to_use,
+                subset,
+                split="dev",
+                download_mode=download_mode,
+            )
+            logger.info(f"DEV loaded for {subset}: {len(eval_dataset)} rows")
+
             if len(eval_dataset) > 1000:
+                logger.info(f"Reducing dev dataset for {subset} from {len(eval_dataset)} to 1000")
                 eval_dataset = eval_dataset.select(range(1000))
         except Exception:
-            logging.info(
-                f"Could not load dataset {dataset_to_use}/{source_lang}-{target_lang} dev split, splitting 1k samples from train"
-            )
-            dataset = train_dataset.train_test_split(test_size=1000, shuffle=True)
-            train_dataset = dataset["train"]
-            eval_dataset = dataset["test"]
+            logger.warning(f"No usable dev split for {subset}, trying fallback split from train")
+            try:
+                split_size = min(1000, max(1, len(train_dataset) // 10))
+                split = train_dataset.train_test_split(test_size=split_size, shuffle=True)
+                train_dataset = split["train"]
+                eval_dataset = split["test"]
+                logger.info(
+                    f"Fallback split created for {subset}: "
+                    f"train={len(train_dataset)} eval={len(eval_dataset)}"
+                )
+            except Exception:
+                log_exception(f"FAILED DEV fallback for {subset}", subset=subset, stage="dev")
+                dataset_summary["failed_dev"].append(subset)
+                continue
 
         train_dataset_dict[subset] = train_dataset
         eval_dataset_dict[subset] = eval_dataset
-logging.info(train_dataset_dict)
+        dataset_summary["loaded_train_subsets"].append(subset)
+        dataset_summary["loaded_eval_subsets"].append(subset)
+
+        logger.info(f"SUCCESS {subset} | train={len(train_dataset)} | eval={len(eval_dataset)}")
+
+logger.info(f"Loaded train subsets: {list(train_dataset_dict.keys())}")
+logger.info(f"Loaded eval subsets: {list(eval_dataset_dict.keys())}")
+
+json_dump(dataset_summary, f"{RUN_PATH}/dataset_load_summary.json")
+
+if len(train_dataset_dict) == 0:
+    raise ValueError("No training datasets were loaded successfully.")
 
 
-# We want the student EN embeddings to be similar to the teacher EN embeddings and
-# the student non-EN embeddings to be similar to the teacher EN embeddings
+# =========================
+# PREPARE DATA
+# =========================
 def prepare_dataset(batch):
+    labels = teacher_model.encode(
+        batch["english"],
+        batch_size=inference_batch_size,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
     return {
         "english": batch["english"],
         "non_english": batch["non_english"],
-        "label": teacher_model.encode(batch["english"], batch_size=inference_batch_size, show_progress_bar=False),
+        "label": labels,
     }
 
 
-column_names = list(train_dataset_dict.values())[0].column_names
-train_dataset_dict = train_dataset_dict.map(
-    prepare_dataset, batched=True, batch_size=30000, remove_columns=column_names
-)
-logging.info("Prepared datasets for training:", train_dataset_dict)
+logger.info("Starting preprocessing for train/eval datasets...")
 
-# 3. Define our training loss
-# MSELoss (https://sbert.net/docs/package_reference/sentence_transformer/losses.html#mseloss) needs one text columns and one
-# column with embeddings from the teacher model
+for subset in list(train_dataset_dict.keys()):
+    logger.info("-" * 80)
+    logger.info(f"Preprocessing TRAIN subset: {subset}")
+    try:
+        train_dataset_dict[subset] = train_dataset_dict[subset].map(
+            prepare_dataset,
+            batched=True,
+            batch_size=preprocess_batch_size,
+            desc=f"Preprocess train {subset}",
+        )
+        logger.info(f"TRAIN preprocessing done for {subset}")
+    except Exception:
+        log_exception(f"PREPROCESS TRAIN FAIL for {subset}", subset=subset, stage="preprocess_train")
+        dataset_summary["failed_preprocess_train"].append(subset)
+        del train_dataset_dict[subset]
+        if subset in eval_dataset_dict:
+            del eval_dataset_dict[subset]
+        continue
+
+    logger.info(f"Preprocessing EVAL subset: {subset}")
+    try:
+        eval_dataset_dict[subset] = eval_dataset_dict[subset].map(
+            prepare_dataset,
+            batched=True,
+            batch_size=preprocess_batch_size,
+            desc=f"Preprocess eval {subset}",
+        )
+        logger.info(f"EVAL preprocessing done for {subset}")
+    except Exception:
+        log_exception(f"PREPROCESS EVAL FAIL for {subset}", subset=subset, stage="preprocess_eval")
+        dataset_summary["failed_preprocess_eval"].append(subset)
+        del train_dataset_dict[subset]
+        del eval_dataset_dict[subset]
+        continue
+
+json_dump(dataset_summary, f"{RUN_PATH}/dataset_load_summary.json")
+
+if len(train_dataset_dict) == 0:
+    raise ValueError("All datasets failed during preprocessing.")
+
+
+# =========================
+# DEFINE LOSS
+# =========================
 train_loss = MSELoss(model=student_model)
 
-# 4. Define evaluators for use during training. This is useful to keep track of alongside the evaluation loss.
+
+# =========================
+# DEFINE EVALUATORS
+# =========================
+logger.info("Creating evaluators...")
 evaluators = []
 
 for subset, eval_dataset in eval_dataset_dict.items():
     logger.info(f"Creating evaluators for {subset}")
 
-    # Mean Squared Error (MSE) measures the (euclidean) distance between teacher and student embeddings
-    dev_mse = MSEEvaluator(
-        source_sentences=eval_dataset["english"],
-        target_sentences=eval_dataset["non_english"],
-        name=subset,
-        teacher_model=teacher_model,
-        batch_size=inference_batch_size,
-    )
-    evaluators.append(dev_mse)
-
-    # TranslationEvaluator computes the embeddings for all parallel sentences. It then check if the embedding of
-    # source[i] is the closest to target[i] out of all available target sentences
-    dev_trans_acc = TranslationEvaluator(
-        source_sentences=eval_dataset["english"],
-        target_sentences=eval_dataset["non_english"],
-        name=subset,
-        batch_size=inference_batch_size,
-    )
-    evaluators.append(dev_trans_acc)
-
-    # Try to load this subset from STS17
-    test_dataset = None
     try:
-        test_dataset = load_dataset("mteb/sts17-crosslingual-sts", subset, split="test")
+        dev_mse = MSEEvaluator(
+            source_sentences=eval_dataset["english"],
+            target_sentences=eval_dataset["non_english"],
+            name=subset,
+            teacher_model=teacher_model,
+            batch_size=inference_batch_size,
+        )
+        evaluators.append(dev_mse)
+
+        dev_trans_acc = TranslationEvaluator(
+            source_sentences=eval_dataset["english"],
+            target_sentences=eval_dataset["non_english"],
+            name=subset,
+            batch_size=inference_batch_size,
+        )
+        evaluators.append(dev_trans_acc)
+    except Exception:
+        log_exception(f"EVALUATOR CREATION FAIL for {subset}", subset=subset, stage="evaluator")
+        continue
+
+    test_dataset = None
+    sts_subset_name = subset
+
+    try:
+        test_dataset = load_dataset(
+            sts_dataset_name,
+            subset,
+            split="test",
+            download_mode=download_mode,
+        )
     except Exception:
         try:
-            test_dataset = load_dataset("mteb/sts17-crosslingual-sts", f"{subset[3:]}-{subset[:2]}", split="test")
-            subset = f"{subset[3:]}-{subset[:2]}"
+            reversed_subset = f"{subset[3:]}-{subset[:2]}"
+            test_dataset = load_dataset(
+                sts_dataset_name,
+                reversed_subset,
+                split="test",
+                download_mode=download_mode,
+            )
+            sts_subset_name = reversed_subset
         except Exception:
-            pass
-    if test_dataset:
-        test_evaluator = EmbeddingSimilarityEvaluator(
-            sentences1=test_dataset["sentence1"],
-            sentences2=test_dataset["sentence2"],
-            scores=[score / 5.0 for score in test_dataset["score"]],  # Convert 0-5 scores to 0-1 scores
-            batch_size=inference_batch_size,
-            name=f"sts17-{subset}-test",
-            show_progress_bar=False,
-        )
-        evaluators.append(test_evaluator)
+            test_dataset = None
 
-evaluator = SequentialEvaluator(evaluators, main_score_function=lambda scores: np.mean(scores))
-# Now also prepare the evaluation datasets for training
-eval_dataset_dict = eval_dataset_dict.map(prepare_dataset, batched=True, batch_size=30000, remove_columns=column_names)
+    if test_dataset is not None:
+        try:
+            test_evaluator = EmbeddingSimilarityEvaluator(
+                sentences1=test_dataset["sentence1"],
+                sentences2=test_dataset["sentence2"],
+                scores=[score / 5.0 for score in test_dataset["score"]],
+                batch_size=inference_batch_size,
+                name=f"sts17-{sts_subset_name}-test",
+                show_progress_bar=False,
+            )
+            evaluators.append(test_evaluator)
+            dataset_summary["sts_loaded"].append(sts_subset_name)
+        except Exception:
+            log_exception(
+                f"STS EVALUATOR FAIL for {sts_subset_name}",
+                subset=sts_subset_name,
+                stage="sts_evaluator",
+            )
+    else:
+        dataset_summary["sts_missing"].append(subset)
 
-# 5. Define the training arguments
+json_dump(dataset_summary, f"{RUN_PATH}/dataset_load_summary.json")
+
+if len(evaluators) == 0:
+    logger.warning("No evaluators were created. Training will continue without evaluator.")
+    evaluator = None
+else:
+    evaluator = SequentialEvaluator(
+        evaluators,
+        main_score_function=lambda scores: np.mean(scores),
+    )
+
+
+# =========================
+# TRAINING ARGS
+# =========================
+logger.info("Building training arguments...")
 args = SentenceTransformerTrainingArguments(
-    # Required parameter:
     output_dir=output_dir,
-    # Optional training parameters:
     num_train_epochs=num_train_epochs,
     per_device_train_batch_size=train_batch_size,
     per_device_eval_batch_size=train_batch_size,
     warmup_ratio=0.1,
-    fp16=True,  # Set to False if you get an error that your GPU can't run on FP16
-    bf16=False,  # Set to True if you have a GPU that supports BF16
+    fp16=torch.cuda.is_available(),
+    bf16=False,
     learning_rate=2e-5,
-    # Optional tracking/debugging parameters:
-    eval_strategy="steps",
-    eval_steps=num_evaluation_steps,
+    eval_strategy="steps" if evaluator is not None else "no",
+    eval_steps=num_evaluation_steps if evaluator is not None else None,
     save_strategy="steps",
     save_steps=num_evaluation_steps,
     save_total_limit=2,
     logging_steps=100,
-    run_name=f"multilingual-{'-'.join(source_languages)}-{'-'.join(target_languages)}",  # Will be used in W&B if `wandb` is installed
+    run_name=f"multilingual-{'-'.join(source_languages)}-debug",
 )
 
-# 6. Create the trainer & start training
+
+# =========================
+# TRAINER
+# =========================
+logger.info("Creating trainer...")
 trainer = SentenceTransformerTrainer(
     model=student_model,
     args=args,
     train_dataset=train_dataset_dict,
-    eval_dataset=eval_dataset_dict,
+    eval_dataset=eval_dataset_dict if evaluator is not None else None,
     loss=train_loss,
     evaluator=evaluator,
 )
-trainer.train()
 
-# 7. Save the trained & evaluated model locally
+
+# =========================
+# TRAIN
+# =========================
+logger.info("Starting training...")
+try:
+    trainer.train()
+    logger.info("Training finished successfully")
+except Exception:
+    log_exception("TRAINING FAILED", stage="training")
+    raise
+
+
+# =========================
+# SAVE FINAL MODEL
+# =========================
 final_output_dir = f"{output_dir}/final"
-student_model.save(final_output_dir)
+os.makedirs(final_output_dir, exist_ok=True)
 
+try:
+    student_model.save(final_output_dir)
+    logger.info(f"Final model saved to: {final_output_dir}")
+except Exception:
+    log_exception("FINAL MODEL SAVE FAILED", stage="save")
+    raise
+
+
+# =========================
+# FINAL SUMMARY
+# =========================
+final_summary = {
+    "run_id": RUN_ID,
+    "run_path": RUN_PATH,
+    "final_output_dir": final_output_dir,
+    "loaded_train_subsets_count": len(dataset_summary["loaded_train_subsets"]),
+    "loaded_eval_subsets_count": len(dataset_summary["loaded_eval_subsets"]),
+    "failed_train_count": len(dataset_summary["failed_train"]),
+    "failed_dev_count": len(dataset_summary["failed_dev"]),
+    "failed_preprocess_train_count": len(dataset_summary["failed_preprocess_train"]),
+    "failed_preprocess_eval_count": len(dataset_summary["failed_preprocess_eval"]),
+    "sts_loaded_count": len(dataset_summary["sts_loaded"]),
+    "sts_missing_count": len(dataset_summary["sts_missing"]),
+}
+json_dump(final_summary, f"{RUN_PATH}/final_summary.json")
+json_dump(dataset_summary, f"{RUN_PATH}/dataset_load_summary.json")
+
+logger.info("Run completed.")
+logger.info(f"Final summary saved to: {RUN_PATH}/final_summary.json")
+
+faulthandler_file.close()
