@@ -56,14 +56,14 @@ The original raw training data can be reconstructed using:
 
 The data used in experiments is **automatically selected** based on the language setting (`deu_Latn` or `tur_Latn`) in:
 
-code/environment_full_xlmr.sh
+`code/environment_full_xlmr.sh`
 
 ## Feature Encoding
 
 For the regression analysis, linguistic feature tables are encoded using:
 
-encoder.py
-encoder_one_hot.py
+`encoder.py`
+`encoder_one_hot.py`
 
 The raw feature tables (for German and Turkish) are provided in the external data link above.
 
