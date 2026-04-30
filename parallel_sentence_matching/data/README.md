@@ -1,7 +1,7 @@
 # Data
 
 This repository contains only a **small subset of the data** required to run the full pipeline.  
-The complete datasets are **not included due to size constraints** and will be provided separately ([Link](https://syncandshare.lrz.de/getlink/fiQhwKNzpRQctxoNkg1Qn7/data)).
+The complete datasets are **not included due to size constraints** and are provided separately ([Link](https://syncandshare.lrz.de/getlink/fiQhwKNzpRQctxoNkg1Qn7/data)).
 
 ---
 
@@ -43,11 +43,11 @@ To reconstruct the training data:
 - Use:
   - `code/gettraindata.py`
   - `code/merger.py`
-- These scripts generate the required training files, including the **merged large dataset**
-Due to size constraints, the full raw datasets are not provided via the link above.  
-Instead, only the merged dataset (directly usable for training) is included.  
 
-The raw data can be reconstructed using:
+Due to size constraints, the full raw datasets are not provided in the external link.  
+Instead, only the **merged dataset (directly usable for training)** is included.
+
+The original raw training data can be reconstructed using:
 `code/gettraindata.py`
 
 ---
@@ -56,5 +56,19 @@ The raw data can be reconstructed using:
 
 The data used in experiments is **automatically selected** based on the language setting (`deu_Latn` or `tur_Latn`) in:
 
-```bash
 code/environment_full_xlmr.sh
+
+## Feature Encoding
+
+For the regression analysis, linguistic feature tables are encoded using:
+
+encoder.py
+encoder_one_hot.py
+
+The raw feature tables (for German and Turkish) are provided in the external data link above.
+
+In this setup:
+
+The feature tables are stored as Excel files (.xlsx)
+The file paths are hardcoded inside the encoder scripts
+These paths must be adapted manually if the files are stored elsewhere
