@@ -37,7 +37,7 @@ Currently includes subfolders for:
 ---
 
 ### `train/`
-Training data is **not fully included** in this repository.
+Training data for the finetuning experiment (mmBert) is **not fully included** in this repository.
 
 To reconstruct the training data:
 - Use:
